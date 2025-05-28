@@ -61,22 +61,40 @@ with st.sidebar:
         st.session_state['trained_models'] = {}
         st.session_state['training_history'] = {}
     
-    st.sidebar.header("Sample Size")
-    train_sample_size = st.sidebar.slider(
-        "Training samples:",
-        min_value=1000,
-        max_value=20000,
-        value=5000,
-        step=1000
-    )
+    st.sidebar.header("Data Sampling")
+    train_sample_pct = st.sidebar.slider(
+        "Percentage of training data to use:",
+        min_value=1,
+        max_value=100,
+        value=20,
+        step=1,
+        help="Percentage of the full training dataset to use for model training"
+    ) / 100.0
     
-    val_sample_size = st.sidebar.slider(
-        "Validation samples:",
-        min_value=500,
-        max_value=5000,
-        value=1000,
-        step=500
-    )
+    val_sample_pct = st.sidebar.slider(
+        "Percentage of validation data to use:",
+        min_value=1,
+        max_value=100,
+        value=20,
+        step=1,
+        help="Percentage of the full validation dataset to use for model evaluation"
+    ) / 100.0
+    
+    # Display estimated sample sizes
+    from utils.data_loader import get_dataset_row_count
+    try:
+        train_total = get_dataset_row_count(selected_dataset, "train")
+        val_total = get_dataset_row_count(selected_dataset, "validation")
+        train_sample_size = int(train_total * train_sample_pct)
+        val_sample_size = int(val_total * val_sample_pct)
+        st.sidebar.info(
+            f"Using {train_sample_pct*100:.0f}% of training data: ~{train_sample_size:,} samples\n"
+            f"Using {val_sample_pct*100:.0f}% of validation data: ~{val_sample_size:,} samples"
+        )
+    except Exception as e:
+        st.sidebar.warning("Could not load dataset size information. Using default sampling.")
+        train_sample_size = 5000
+        val_sample_size = 1000
 
 # Main content
 st.header("Learning to Rank Approaches")
@@ -135,6 +153,9 @@ with approaches_tab3:
 # Data loading section
 st.header("Data Loading")
 
+# Create a unique key for the current sampling configuration
+sampling_key = f"{selected_dataset}_{train_sample_pct:.2f}_{val_sample_pct:.2f}"
+
 # Load data
 load_data_container = st.container()
 
@@ -147,24 +168,53 @@ with load_data_container:
     with col2:
         data_loading_placeholder = st.empty()
 
-if load_data_button or ('train_df' in st.session_state and 'val_df' in st.session_state):
-    if 'train_df' not in st.session_state or 'val_df' not in st.session_state:
-        data_loading_placeholder.info("Loading data...")
-        
-        with st.spinner(f"Loading {train_sample_size} training samples and {val_sample_size} validation samples..."):
-            train_df = load_dataset(selected_dataset, "train", max_samples=train_sample_size)
-            val_df = load_dataset(selected_dataset, "validation", max_samples=val_sample_size)
-            
-            if train_df is not None and val_df is not None:
-                st.session_state['train_df'] = train_df
-                st.session_state['val_df'] = val_df
-                data_loading_placeholder.success("Data loaded successfully!")
-            else:
-                data_loading_placeholder.error("Failed to load data. Please try again.")
-    else:
+# Check if we need to load new data
+should_load_data = False
+
+if load_data_button:
+    should_load_data = True
+    # Clear any existing data to force reload
+    if 'last_sampling_key' in st.session_state and st.session_state['last_sampling_key'] != sampling_key:
+        if 'train_df' in st.session_state:
+            del st.session_state['train_df']
+        if 'val_df' in st.session_state:
+            del st.session_state['val_df']
+    st.session_state['last_sampling_key'] = sampling_key
+
+if 'train_df' in st.session_state and 'val_df' in st.session_state:
+    # Check if the sampling has changed since last load
+    if 'last_sampling_key' in st.session_state and st.session_state['last_sampling_key'] == sampling_key:
         train_df = st.session_state['train_df']
         val_df = st.session_state['val_df']
-        data_loading_placeholder.success("Data already loaded.")
+        data_loading_placeholder.success("Data loaded successfully!")
+    else:
+        should_load_data = True
+
+# Load data if needed
+if should_load_data or 'train_df' not in st.session_state or 'val_df' not in st.session_state:
+    data_loading_placeholder.info("Loading data...")
+    
+    with st.spinner(f"Loading {train_sample_size} training samples and {val_sample_size} validation samples..."):
+        # Clear the cache for load_dataset to ensure we get fresh data
+        if 'load_dataset' in st.session_state.get('_cache_data', {}):
+            st.cache_data.clear()
+            
+        train_df = load_dataset(selected_dataset, "train", max_samples=train_sample_size)
+        val_df = load_dataset(selected_dataset, "validation", max_samples=val_sample_size)
+        
+        if train_df is not None and val_df is not None:
+            st.session_state['train_df'] = train_df
+            st.session_state['val_df'] = val_df
+            st.session_state['last_sampling_key'] = sampling_key
+            data_loading_placeholder.success("Data loaded successfully!")
+        else:
+            data_loading_placeholder.error("Failed to load data. Please try again.")
+            st.stop()
+
+# Show data summary and model training sections if we have data
+if 'train_df' in st.session_state and 'val_df' in st.session_state:
+    train_df = st.session_state['train_df']
+    val_df = st.session_state['val_df']
     
     # Data summary
     st.subheader("Data Summary")
@@ -202,184 +252,245 @@ if load_data_button or ('train_df' in st.session_state and 'val_df' in st.sessio
         )
         fig.update_traces(textposition='inside', textinfo='percent+label')
         st.plotly_chart(fig, use_container_width=True)
-    
-    # Feature selection
-    st.header("Feature Selection")
-    st.markdown("""
-    Select features to use for training. Features are organized into:
-
-    1. **Document Field Features** (1-125):
-       - Body text features (1-25)
-       - Anchor text features (26-50)
-       - Title features (51-75)
-       - URL features (76-100)
-       - Whole document features (101-125)
-
-    2. **Miscellaneous Features** (126-136):
-       - URL structure features (126-127)
-       - Link features (128-129)
-       - Ranking features (130-131)
-       - Quality features (132-133)
-       - Click-based features (134-136)
-    """)
-
-    # Add feature group selection
-    selected_groups = st.multiselect(
-        "Select feature groups to use:",
-        options=list(FEATURE_GROUPS.keys()),
-        default=list(FEATURE_GROUPS.keys())
-    )
-    
-    selected_features = None
-    
-    if selected_groups:
-        selected_features = []
-        for group in selected_groups:
-            selected_features.extend(FEATURE_GROUPS[group])
         
-        st.success(f"Selected {len(selected_features)} features from {len(selected_groups)} groups.")
+    # Model training section
+    st.header("Model Training")
     
-    # Model selection and training
-    st.header("Model Selection & Training")
-    
-    # Get available models (filtered based on installed libraries)
-    available_models = get_available_models()
-    
-    # Display info about available libraries
-    if not LIGHTGBM_AVAILABLE:
-        st.warning("LightGBM is not available. Some models will not be available.")
-    
-    if not XGBOOST_AVAILABLE:
-        st.warning("XGBoost is not available. Some models will not be available.")
-    
-    if not available_models:
-        st.error("No models are available. Please install the required libraries.")
-        st.stop()
-    
-    # Select approach (only show approaches that have models available)
-    approach_options = list(available_models.keys())
-    selected_approach = st.selectbox(
-        "Select a ranking approach:",
-        options=approach_options,
-        index=0
-    )
-    
-    # Select model based on approach
-    selected_model = st.selectbox(
-        "Select a model:",
-        options=available_models[selected_approach],
-        index=0
-    )
-    
-    # Get default parameters for the selected model
-    default_params = get_model_params(selected_model)
-    
-    # Display and allow editing of model parameters
-    st.subheader("Model Parameters")
-    
-    model_params = {}
-    
-    # Create parameter inputs based on model type
-    if selected_model == 'Linear Regression (Ridge)':
-        col1, col2 = st.columns(2)
-        with col1:
-            model_params['alpha'] = st.number_input("Alpha (regularization)", 
-                                                  min_value=0.0, max_value=10.0, 
-                                                  value=default_params.get('alpha', 1.0), step=0.1)
-        with col2:
-            model_params['max_iter'] = st.number_input("Max Iterations", 
-                                                     min_value=100, max_value=10000, 
-                                                     value=default_params.get('max_iter', 1000), step=100)
-    
-    elif selected_model == 'Random Forest Regressor':
-        col1, col2 = st.columns(2)
-        with col1:
-            model_params['n_estimators'] = st.number_input("Number of Estimators", 
-                                                         min_value=10, max_value=500, 
-                                                         value=default_params.get('n_estimators', 100), step=10)
-            model_params['min_samples_split'] = st.number_input("Min Samples Split", 
-                                                              min_value=2, max_value=20, 
-                                                              value=default_params.get('min_samples_split', 2), step=1)
-        with col2:
-            model_params['max_depth'] = st.number_input("Max Depth", 
-                                                      min_value=5, max_value=100, 
-                                                      value=default_params.get('max_depth', 10), step=5)
-            model_params['min_samples_leaf'] = st.number_input("Min Samples Leaf", 
-                                                             min_value=1, max_value=20, 
-                                                             value=default_params.get('min_samples_leaf', 1), step=1)
-    
-    elif selected_model.startswith('LightGBM'):
-        col1, col2 = st.columns(2)
-        with col1:
-            model_params['num_leaves'] = st.number_input("Number of Leaves", 
-                                                      min_value=10, max_value=255, 
-                                                      value=default_params.get('num_leaves', 31), step=5)
-            model_params['learning_rate'] = st.number_input("Learning Rate", 
-                                                          min_value=0.01, max_value=0.5, 
-                                                          value=default_params.get('learning_rate', 0.1), step=0.01,
-                                                          format="%.2f")
-        with col2:
-            model_params['n_estimators'] = st.number_input("Number of Estimators", 
-                                                         min_value=10, max_value=500, 
-                                                         value=default_params.get('n_estimators', 100), step=10)
-            model_params['max_depth'] = st.number_input("Max Depth", 
-                                                      min_value=-1, max_value=100, 
-                                                      value=default_params.get('max_depth', -1), step=5)
+    # Model selection and training form
+    with st.form("model_training_form"):
+        # Get available models (filtered based on installed libraries)
+        available_models = get_available_models()
         
-        # Additional parameters for LambdaMART
-        if 'Ranker' in selected_model:
-            st.markdown("### LambdaMART Parameters")
-            model_params['ndcg_eval_at'] = [1, 3, 5, 10]  # Fixed evaluation points for simplicity
-    
-    elif selected_model.startswith('XGBoost'):
-        col1, col2 = st.columns(2)
-        with col1:
-            model_params['max_depth'] = st.number_input("Max Depth", 
-                                                      min_value=3, max_value=20, 
-                                                      value=default_params.get('max_depth', 6), step=1)
-            model_params['learning_rate'] = st.number_input("Learning Rate", 
-                                                          min_value=0.01, max_value=0.5, 
-                                                          value=default_params.get('learning_rate', 0.1), step=0.01,
-                                                          format="%.2f")
-        with col2:
-            model_params['n_estimators'] = st.number_input("Number of Estimators", 
-                                                         min_value=10, max_value=500, 
-                                                         value=default_params.get('n_estimators', 100), step=10)
-    
-    elif selected_model.startswith('TF-Ranking'):
-        col1, col2 = st.columns(2)
-        with col1:
-            model_params['learning_rate'] = st.number_input("Learning Rate", 
-                                                          min_value=0.001, max_value=0.1, 
-                                                          value=default_params.get('learning_rate', 0.05), step=0.001,
-                                                          format="%.3f")
-            model_params['batch_size'] = st.number_input("Batch Size", 
-                                                       min_value=32, max_value=512, 
-                                                       value=default_params.get('batch_size', 128), step=32)
-        with col2:
-            model_params['epochs'] = st.number_input("Epochs", 
-                                                   min_value=5, max_value=50, 
-                                                   value=default_params.get('epochs', 10), step=1)
+        # Display info about available libraries
+        if not LIGHTGBM_AVAILABLE:
+            st.warning("LightGBM is not available. Some models will not be available.")
+        
+        if not XGBOOST_AVAILABLE:
+            st.warning("XGBoost is not available. Some models will not be available.")
             
-            # Loss function selection
-            if selected_model == 'TF-Ranking (pairwise)':
-                loss_options = ["pairwise_logistic_loss", "pairwise_hinge_loss"]
-            else:  # listwise
-                loss_options = ["softmax_loss", "list_mle_loss"]
-            
-            model_params['loss'] = st.selectbox("Loss Function", options=loss_options)
+        if not available_models:
+            st.error("No models are available. Please install the required libraries.")
+            st.stop()
         
-        # Hidden layers specification
-        st.markdown("### Model Architecture")
-        hidden_layers_str = st.text_input("Hidden Layers (comma-separated)", 
-                                       value=",".join(map(str, default_params.get('hidden_layers', [64, 32]))))
-        model_params['hidden_layers'] = [int(x.strip()) for x in hidden_layers_str.split(",") if x.strip()]
-    
-    # Train model button
-    train_button = st.button("Train Model", type="primary", key="train_model_button")
-    
-    if train_button:
-        if 'train_df' in st.session_state and 'val_df' in st.session_state:
+        # Select approach (only show approaches that have models available)
+        approach_options = [approach for approach, models in available_models.items() if models]
+        selected_approach = st.selectbox(
+            "Select a ranking approach:",
+            options=approach_options,
+            index=0
+        )
+        
+        # Select model based on approach
+        selected_model = st.selectbox(
+            "Select a model:",
+            options=available_models[selected_approach],
+            index=0
+        )
+        
+        # Get default parameters for the selected model
+        default_params = get_model_params(selected_model)
+        
+        # Model parameters based on selection
+        model_params = {}
+        
+        # Add model-specific parameters
+        if selected_model == 'Linear Regression (Ridge)':
+            col1, col2 = st.columns(2)
+            with col1:
+                model_params['alpha'] = st.number_input(
+                    "Alpha (regularization)", 
+                    min_value=0.0, max_value=10.0, 
+                    value=default_params.get('alpha', 1.0), 
+                    step=0.1
+                )
+        
+        # Feature selection
+        st.header("Feature Selection")
+        st.markdown("""
+        Select features to use for training. Features are organized into:
+
+        1. **Document Field Features** (1-125):
+           - Body text features (1-25)
+           - Anchor text features (26-50)
+           - Title features (51-75)
+           - URL features (76-100)
+           - Whole document features (101-125)
+
+        2. **Miscellaneous Features** (126-136):
+           - URL structure features (126-127)
+           - Link features (128-129)
+           - Ranking features (130-131)
+           - Quality features (132-133)
+           - Click-based features (134-136)
+        """)
+
+        # Add feature group selection
+        selected_groups = st.multiselect(
+            "Select feature groups to use:",
+            options=list(FEATURE_GROUPS.keys()),
+            default=list(FEATURE_GROUPS.keys())
+        )
+        
+        selected_features = None
+        
+        if selected_groups:
+            selected_features = []
+            for group in selected_groups:
+                selected_features.extend(FEATURE_GROUPS[group])
+            
+            st.success(f"Selected {len(selected_features)} features from {len(selected_groups)} groups.")
+        
+        # Model parameters
+        st.header("Model Parameters")
+        
+        # Get default parameters for the selected model
+        default_params = get_model_params(selected_model)
+        
+        # Display and allow editing of model parameters
+        st.subheader("Model Parameters")
+        
+        model_params = {}
+        
+        # Create parameter inputs based on model type
+        if selected_model == 'Linear Regression (Ridge)':
+            col1, col2 = st.columns(2)
+            with col1:
+                model_params['alpha'] = st.number_input(
+                    "Alpha (regularization)",
+                    min_value=0.0, max_value=10.0,
+                    value=default_params.get('alpha', 1.0), step=0.1,
+                    key=f"alpha_{selected_model}"
+                )
+            with col2:
+                model_params['max_iter'] = st.number_input(
+                    "Max Iterations",
+                    min_value=100, max_value=10000,
+                    value=default_params.get('max_iter', 1000), step=100,
+                    key=f"max_iter_{selected_model}"
+                )
+        
+        elif selected_model == 'Random Forest Regressor':
+            col1, col2 = st.columns(2)
+            with col1:
+                model_params['n_estimators'] = st.number_input(
+                    "Number of Estimators",
+                    min_value=10, max_value=500,
+                    value=default_params.get('n_estimators', 100), step=10,
+                    key=f"n_estimators_{selected_model}"
+                )
+                model_params['min_samples_split'] = st.number_input(
+                    "Min Samples Split",
+                    min_value=2, max_value=20,
+                    value=default_params.get('min_samples_split', 2), step=1,
+                    key=f"min_samples_split_{selected_model}"
+                )
+            with col2:
+                model_params['max_depth'] = st.number_input(
+                    "Max Depth",
+                    min_value=5, max_value=100,
+                    value=default_params.get('max_depth', 10), step=5,
+                    key=f"max_depth_{selected_model}"
+                )
+                model_params['min_samples_leaf'] = st.number_input(
+                    "Min Samples Leaf",
+                    min_value=1, max_value=20,
+                    value=default_params.get('min_samples_leaf', 1), step=1,
+                    key=f"min_samples_leaf_{selected_model}"
+                )
+        
+        elif selected_model.startswith('LightGBM'):
+            col1, col2 = st.columns(2)
+            with col1:
+                model_params['num_leaves'] = st.number_input(
+                    "Number of Leaves",
+                    min_value=10, max_value=255,
+                    value=default_params.get('num_leaves', 31), step=5,
+                    key=f"num_leaves_{selected_model}"
+                )
+                model_params['learning_rate'] = st.number_input(
+                    "Learning Rate",
+                    min_value=0.01, max_value=0.5,
+                    value=default_params.get('learning_rate', 0.1), step=0.01,
+                    format="%.2f",
+                    key=f"learning_rate_{selected_model}"
+                )
+            with col2:
+                model_params['n_estimators'] = st.number_input(
+                    "Number of Estimators",
+                    min_value=10, max_value=500,
+                    value=default_params.get('n_estimators', 100), step=10,
+                    key=f"n_estimators_lgbm_{selected_model}"
+                )
+                model_params['max_depth'] = st.number_input(
+                    "Max Depth",
+                    min_value=-1, max_value=100,
+                    value=default_params.get('max_depth', -1), step=5,
+                    key=f"max_depth_lgbm_{selected_model}"
+                )
+        
+            # Additional parameters for LambdaMART
+            if 'Ranker' in selected_model:
+                st.markdown("### LambdaMART Parameters")
+                model_params['ndcg_eval_at'] = [1, 3, 5, 10]  # Fixed evaluation points for simplicity
+        
+        elif selected_model.startswith('XGBoost'):
+            col1, col2 = st.columns(2)
+            with col1:
+                model_params['max_depth'] = st.number_input(
+                    "Max Depth",
+                    min_value=3, max_value=20,
+                    value=default_params.get('max_depth', 6), step=1,
+                    key=f"max_depth_xgb_{selected_model}"
+                )
+                model_params['learning_rate'] = st.number_input(
+                    "Learning Rate",
+                    min_value=0.01, max_value=0.5,
+                    value=default_params.get('learning_rate', 0.1), step=0.01,
+                    format="%.2f",
+                    key=f"learning_rate_xgb_{selected_model}"
+                )
+            with col2:
+                model_params['n_estimators'] = st.number_input(
+                    "Number of Estimators",
+                    min_value=10, max_value=500,
+                    value=default_params.get('n_estimators', 100), step=10,
+                    key=f"n_estimators_xgb_{selected_model}"
+                )
+        
+        elif selected_model.startswith('TF-Ranking'):
+            col1, col2 = st.columns(2)
+            with col1:
+                model_params['learning_rate'] = st.number_input(
+                    "Learning Rate",
+                    min_value=0.001, max_value=0.1,
+                    value=default_params.get('learning_rate', 0.05), step=0.001,
+                    format="%.3f",
+                    key=f"learning_rate_tf_{selected_model}"
+                )
+                model_params['batch_size'] = st.number_input(
+                    "Batch Size",
+                    min_value=32, max_value=512,
+                    value=default_params.get('batch_size', 128), step=32,
+                    key=f"batch_size_tf_{selected_model}"
+                )
+            with col2:
+                model_params['epochs'] = st.number_input(
+                    "Epochs",
+                    min_value=5, max_value=50,
+                    value=default_params.get('epochs', 10), step=1,
+                    key=f"epochs_tf_{selected_model}"
+                )
+                
+                # Loss function selection
+                if selected_model == 'TF-Ranking (pairwise)':
+                    loss_options = ["pairwise_logistic_loss", "pairwise_hinge_loss"]
+                else:  # listwise
+                    loss_options = ["softmax_loss", "list_mle_loss"]
+            
+        # Add submit button for the form
+        submit_button = st.form_submit_button("Train Model")
+        
+        if submit_button:
             # Create a progress bar
             progress_bar = st.progress(0, text="Initializing training...")
             
